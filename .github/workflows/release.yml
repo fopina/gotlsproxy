@@ -48,4 +48,4 @@ jobs:
 
       - run: docker push fopina/gotlsproxy:predicted-armv7
 
-      - run: docker push ghcir.io/fopina/gotlsproxy:predicted-armv7
+      - run: docker push ghcr.io/fopina/gotlsproxy:predicted-armv7
