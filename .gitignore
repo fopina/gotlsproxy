@@ -15,4 +15,4 @@
 # vendor/
 
 # other
-dist/
+.DS_Store
