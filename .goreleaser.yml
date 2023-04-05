@@ -26,6 +26,9 @@ builds:
 checksum:
   algorithm: sha256
 
+snapshot:
+  name_template: 'predicted'
+
 dockers:
   - &image-def
     image_templates:
