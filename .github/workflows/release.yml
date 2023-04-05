@@ -43,9 +43,3 @@ jobs:
           workdir: .
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
-      
-      - run: docker images
-
-      - run: docker push fopina/gotlsproxy:predicted-armv7
-
-      - run: docker push ghcr.io/fopina/gotlsproxy:predicted-armv7
