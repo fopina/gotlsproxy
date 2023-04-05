@@ -34,7 +34,7 @@ dockers:
     goos: linux
     goarch: amd64
     build_flag_templates:
-      - --platform=linux/amd64,linux/arm64/v8
+      - --platform=linux/amd64
   - <<: *image-def
     image_templates:
       - fopina/{{.ProjectName}}:{{ .Version }}-arm64
