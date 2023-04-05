@@ -43,3 +43,5 @@ jobs:
           workdir: .
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+      
+      - run: docker images
