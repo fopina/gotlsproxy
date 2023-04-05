@@ -30,7 +30,7 @@ dockers:
   - &image-def
     image_templates:
       - fopina/{{.ProjectName}}:{{ .Version }}-amd64
-      - gchr.io/fopina/{{.ProjectName}}:{{ .Version }}-amd64
+      - ghcr.io/fopina/{{.ProjectName}}:{{ .Version }}-amd64
     use: buildx
     goos: linux
     goarch: amd64
@@ -39,14 +39,14 @@ dockers:
   - <<: *image-def
     image_templates:
       - fopina/{{.ProjectName}}:{{ .Version }}-arm64
-      - gchr.io/fopina/{{.ProjectName}}:{{ .Version }}-arm64
+      - ghcr.io/fopina/{{.ProjectName}}:{{ .Version }}-arm64
     goarch: arm64
     build_flag_templates:
       - --platform=linux/arm64/v8
   - <<: *image-def
     image_templates:
       - fopina/{{.ProjectName}}:{{ .Version }}-armv7
-      - gchr.io/fopina/{{.ProjectName}}:{{ .Version }}-armv7
+      - ghcr.io/fopina/{{.ProjectName}}:{{ .Version }}-armv7
     goarch: arm
     goarm: '7'
     build_flag_templates:
@@ -62,10 +62,10 @@ docker_manifests:
   - <<: *manifest-def
     name_template: fopina/{{.ProjectName}}:latest
   - &manifest-ghcrdef
-    name_template: gchr.io/fopina/{{.ProjectName}}:{{ .Version }}
+    name_template: ghcr.io/fopina/{{.ProjectName}}:{{ .Version }}
     image_templates:
-      - gchr.io/fopina/{{.ProjectName}}:{{ .Version }}-armv7
-      - gchr.io/fopina/{{.ProjectName}}:{{ .Version }}-arm64
-      - gchr.io/fopina/{{.ProjectName}}:{{ .Version }}-amd64
+      - ghcr.io/fopina/{{.ProjectName}}:{{ .Version }}-armv7
+      - ghcr.io/fopina/{{.ProjectName}}:{{ .Version }}-arm64
+      - ghcr.io/fopina/{{.ProjectName}}:{{ .Version }}-amd64
   - <<: *manifest-ghcrdef
     name_template: ghcr.io/fopina/{{.ProjectName}}:{{ .Version }}
