@@ -36,16 +36,24 @@ func hello(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	forwardedHeaders := make(map[string]string)
+	for k, v := range req.Header {
+		if k == "User-Agent" {
+			continue
+		}
+		// cycleTLS does not support multiple values for an header
+		if len(v) > 1 {
+			log.Printf("WARNING: header %s had all values dropped but 1", k)
+		}
+		forwardedHeaders[k] = v[0]
+	}
+
 	response, err := client.Do(mainURL, cycletls.Options{
 		Body:      string(body),
 		Ja3:       ja3,
 		UserAgent: userAgent,
-		Headers: map[string]string{
-			"Accept":       "application/json",
-			"Content-Type": "application/json",
-			"Auth":         req.Header.Get("Auth"),
-		},
-		Timeout: timeout,
+		Headers:   forwardedHeaders,
+		Timeout:   timeout,
 	}, "POST")
 	if err != nil {
 		writeError(w, err)
