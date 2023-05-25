@@ -55,7 +55,7 @@ func hello(w http.ResponseWriter, req *http.Request) {
 		UserAgent: userAgent,
 		Headers:   forwardedHeaders,
 		Timeout:   timeout,
-	}, "POST")
+	}, req.Method)
 	if err != nil {
 		writeError(w, err)
 		return
