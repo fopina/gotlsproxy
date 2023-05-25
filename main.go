@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/Danny-Dasilva/CycleTLS/cycletls"
 )
@@ -48,7 +49,7 @@ func hello(w http.ResponseWriter, req *http.Request) {
 		forwardedHeaders[k] = v[0]
 	}
 
-	response, err := client.Do(mainURL, cycletls.Options{
+	response, err := client.Do(fmt.Sprintf("%s%s", mainURL, req.URL), cycletls.Options{
 		Body:      string(body),
 		Ja3:       ja3,
 		UserAgent: userAgent,
@@ -101,7 +102,7 @@ Flags:
 		os.Exit(2)
 	}
 
-	mainURL = flag.Arg(0)
+	mainURL = strings.TrimRight(flag.Arg(0), "/")
 
 	http.HandleFunc("/", hello)
 	err := http.ListenAndServe(listenAddress, nil)
