@@ -2,16 +2,21 @@ module github.com/fopina/gotlsproxy
 
 go 1.19
 
-require github.com/Danny-Dasilva/CycleTLS/cycletls v0.0.0-20220620102923-c84d740b4757
+require github.com/Danny-Dasilva/CycleTLS/cycletls v1.0.23
 
 require (
-	github.com/Danny-Dasilva/fhttp v0.0.0-20220524230104-f801520157d6 // indirect
+	github.com/Danny-Dasilva/fhttp v0.0.0-20231127034941-9494939f30fa // indirect
 	github.com/Danny-Dasilva/utls v0.0.0-20220604023528-30cb107b834e // indirect
-	github.com/andybalholm/brotli v1.0.5 // indirect
+	github.com/andybalholm/brotli v1.0.6 // indirect
+	github.com/cloudflare/circl v1.3.6 // indirect
 	github.com/dsnet/compress v0.0.1 // indirect
-	github.com/gorilla/websocket v1.5.0 // indirect
+	github.com/gaukas/godicttls v0.0.4 // indirect
+	github.com/gorilla/websocket v1.5.1 // indirect
+	github.com/klauspost/compress v1.17.3 // indirect
+	github.com/quic-go/quic-go v0.40.0 // indirect
+	github.com/refraction-networking/utls v1.5.4 // indirect
 	golang.org/x/crypto v0.17.0 // indirect
-	golang.org/x/net v0.17.0 // indirect
+	golang.org/x/net v0.18.0 // indirect
 	golang.org/x/sys v0.15.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
 )
