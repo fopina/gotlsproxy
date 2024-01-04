@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/Danny-Dasilva/CycleTLS/cycletls"
@@ -30,13 +31,27 @@ func writeError(w http.ResponseWriter, err error) {
 	}
 }
 
+var htmlTagStripper = regexp.MustCompile(`<.*?>`)
+var htmlStyleScriptStripper = regexp.MustCompile(`(?s)<(style|script)\b.*>(.*?)</(style|script)>`)
+var newlineStripper = regexp.MustCompile(`(?s)\n+`)
+
+func cleanErrorResponseBody(body string) string {
+	return newlineStripper.ReplaceAllString(
+		htmlTagStripper.ReplaceAllString(
+			htmlStyleScriptStripper.ReplaceAllString(body, ""),
+			"",
+		),
+		"\n",
+	)
+}
+
 func printIfErrorCode(request *http.Request, response *cycletls.Response) {
 	if response.Status >= 400 {
 		log.Printf("Response status %d", response.Status)
 		log.Printf("== request ==")
 		log.Printf("%v", request)
 		log.Printf("== response ==")
-		log.Printf("%v", response)
+		log.Printf("%v", cycletls.Response{RequestID: response.RequestID, Status: response.Status, Body: cleanErrorResponseBody(response.Body), Headers: response.Headers})
 	}
 }
 
