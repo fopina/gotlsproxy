@@ -118,6 +118,7 @@ Flags:
 	mainURL = strings.TrimRight(flag.Arg(0), "/")
 
 	http.HandleFunc("/", hello)
+	log.Println("Up and running! All requests from http://" + listenAddress + " forwarded to " + mainURL)
 	err := http.ListenAndServe(listenAddress, nil)
 	if err != nil {
 		log.Fatal(err)
