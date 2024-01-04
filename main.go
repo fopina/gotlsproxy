@@ -30,6 +30,16 @@ func writeError(w http.ResponseWriter, err error) {
 	}
 }
 
+func printIfErrorCode(request *http.Request, response *cycletls.Response) {
+	if response.Status >= 400 {
+		log.Printf("Response status %d", response.Status)
+		log.Printf("== request ==")
+		log.Printf("%v", request)
+		log.Printf("== response ==")
+		log.Printf("%v", response)
+	}
+}
+
 func hello(w http.ResponseWriter, req *http.Request) {
 	client := cycletls.Init()
 
@@ -64,12 +74,8 @@ func hello(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if printErrors && (response.Status >= 400) {
-		log.Printf("Response status %d", response.Status)
-		log.Printf("== request ==")
-		log.Printf("%v", req)
-		log.Printf("== response ==")
-		log.Printf("%v", response)
+	if printErrors {
+		printIfErrorCode(req, &response)
 	}
 
 	w.WriteHeader(response.Status)
