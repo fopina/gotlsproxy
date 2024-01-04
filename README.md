@@ -6,7 +6,7 @@ Reverse proxy with JA3 spoofing
 
 ```
 $ gotlsproxy -h
-usage: ./gotlsproxy [flags] [url]
+usage: /gotlsproxy [flags] [url]
 
 Arguments:
   url string
@@ -17,12 +17,25 @@ Flags:
     	Listening address to bind to (default "127.0.0.1:8888")
   -ja3 string
     	JA3 token to spoof, should align with user-agent (default "771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-51-57-47-53-10,0-23-65281-10-11-35-16-5-51-43-13-45-28-21,29-23-24-25-256-257,0")
+  -print-errors
+    	Print request and response when an error (4xx and 5xx) is returned from upstream server
   -timeout int
     	Request timeout (default 60)
   -ua string
     	User-Agent to spoof, should align with JA3 token (default "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:87.0) Gecko/20100101 Firefox/87.0")
+  -upstream-proxy string
+    	Upstream proxy (if any required)
   -version
     	display version
+```
+
+Also available via docker image, hosted both in [Docker Hub](https://hub.docker.com/r/fopina/gotlsproxy) and [GHCR](https://github.com/fopina/gotlsproxy/pkgs/container/gotlsproxy)
+
+```
+$ docker run --rm fopina/gotlsproxy:0.3 -version
+0.3
+$ docker run --rm ghcr.io/fopina/gotlsproxy:0.3 -version
+0.3
 ```
 
 ### Validation
