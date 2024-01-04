@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/Danny-Dasilva/CycleTLS/cycletls"
@@ -27,6 +28,30 @@ func writeError(w http.ResponseWriter, err error) {
 	_, errWrite := w.Write([]byte(err.Error()))
 	if errWrite != nil {
 		log.Printf("ERROR Proxy2Client: %v", errWrite)
+	}
+}
+
+var htmlTagStripper = regexp.MustCompile(`<.*?>`)
+var htmlStyleScriptStripper = regexp.MustCompile(`(?s)<(style|script)\b.*>(.*?)</(style|script)>`)
+var newlineStripper = regexp.MustCompile(`(?s)\n+`)
+
+func cleanErrorResponseBody(body string) string {
+	return newlineStripper.ReplaceAllString(
+		htmlTagStripper.ReplaceAllString(
+			htmlStyleScriptStripper.ReplaceAllString(body, ""),
+			"",
+		),
+		"\n",
+	)
+}
+
+func printIfErrorCode(request *http.Request, response *cycletls.Response) {
+	if response.Status >= 400 {
+		log.Printf("Response status %d", response.Status)
+		log.Printf("== request ==")
+		log.Printf("%v", request)
+		log.Printf("== response ==")
+		log.Printf("%v", cycletls.Response{RequestID: response.RequestID, Status: response.Status, Body: cleanErrorResponseBody(response.Body), Headers: response.Headers})
 	}
 }
 
@@ -64,12 +89,8 @@ func hello(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if printErrors && (response.Status >= 400) {
-		log.Printf("Response status %d", response.Status)
-		log.Printf("== request ==")
-		log.Printf("%v", req)
-		log.Printf("== response ==")
-		log.Printf("%v", response)
+	if printErrors {
+		printIfErrorCode(req, &response)
 	}
 
 	w.WriteHeader(response.Status)
@@ -118,6 +139,7 @@ Flags:
 	mainURL = strings.TrimRight(flag.Arg(0), "/")
 
 	http.HandleFunc("/", hello)
+	log.Println("Up and running! All requests from http://" + listenAddress + " forwarded to " + mainURL)
 	err := http.ListenAndServe(listenAddress, nil)
 	if err != nil {
 		log.Fatal(err)
