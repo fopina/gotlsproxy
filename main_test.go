@@ -47,7 +47,7 @@ func TestPrintIfErrorCode400(t *testing.T) {
 == request ==
 <nil>
 == response ==
-{1 404 not found map[]}
+{1 404 not found map[] [] }
 `, buf.String())
 }
 
