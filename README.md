@@ -55,4 +55,22 @@ $ curl -s localhost:8888 | jq
 }
 ```
 
+Choose another fingerprint (make sure you match the right User-Agent header)
+
+```
+$ gotlsproxy -ja3 "771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-156-157-47-53-10,0-23-65281-10-11-35-16-5-34-51-43-13-45-28-65037,29-23-24-25-256-257,0" \
+             -ua "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0" \
+             https://check.ja3.zone/
+```
+
+```
+$ curl -s localhost:8888 | jq
+{
+  "hash": "4466984d86af2d9230096c1c1848e782",
+  "fingerprint": "771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-156-157-47-53-10,0-23-65281-10-11-35-16-5-34-51-43-13-45-28-65037,29-23-24-25-256-257,0",
+  ...
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0"
+}
+```
+
 The fingerprint seen by the server is exactly the one spoofed by gotlsproxy (default value of `-ja3` flag in this example)
