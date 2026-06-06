@@ -37,3 +37,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	h12.io/socks v1.0.3 // indirect
 )
+
+replace github.com/Danny-Dasilva/CycleTLS/cycletls => github.com/fopina/CycleTLS/cycletls v0.0.0-20260606182123-283dde567e9e
