@@ -2,13 +2,76 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Danny-Dasilva/CycleTLS/cycletls"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+const scrapflyJA3Endpoint = "https://tools.scrapfly.io"
+const userAgentEchoEndpoint = "https://httpbingo.org"
+
+type scrapflyJA3Response struct {
+	JA3       string `json:"ja3"`
+	JA3Digest string `json:"ja3_digest"`
+}
+
+type userAgentResponse struct {
+	UserAgent string `json:"user-agent"`
+}
+
+type smokeFingerprint struct {
+	name          string
+	userAgent     string
+	ja3           string
+	ciphers       string
+	extensions    string
+	supported     string
+	pointFormats  string
+	reportedJA3   string
+	reportedJA3MD string
+}
+
+func fetchScrapflyJA3(t *testing.T, client *http.Client, url string) scrapflyJA3Response {
+	t.Helper()
+
+	resp, err := client.Get(url)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, resp.Body.Close())
+	}()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var fingerprint scrapflyJA3Response
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&fingerprint))
+	require.NotEmpty(t, fingerprint.JA3)
+	require.NotEmpty(t, fingerprint.JA3Digest)
+	return fingerprint
+}
+
+func fetchUserAgent(t *testing.T, client *http.Client, url string) string {
+	t.Helper()
+
+	resp, err := client.Get(url)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, resp.Body.Close())
+	}()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var echoed userAgentResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&echoed))
+	require.NotEmpty(t, echoed.UserAgent)
+	return echoed.UserAgent
+}
 
 func TestPrintIfErrorCode200(t *testing.T) {
 	var buf bytes.Buffer
@@ -70,4 +133,93 @@ func TestCleanErrorResponseBody(t *testing.T) {
 Error 404 (Not Found)!!1
 404. That’s an error.
 The requested URL /asdasdasd was not found on this server.  That’s all we know.`, cleanError)
+}
+
+func TestScrapflyJA3Smoke(t *testing.T) {
+	if os.Getenv("GOTLSPROXY_SCRAPFLY_SMOKE") != "1" {
+		t.Skip("set GOTLSPROXY_SCRAPFLY_SMOKE=1 to run Scrapfly JA3 smoke test")
+	}
+
+	oldMainURL := mainURL
+	oldUserAgent := userAgent
+	oldJA3 := ja3
+	oldTimeout := timeout
+	oldPrintErrors := printErrors
+	oldUpstreamProxy := upstreamProxy
+	defer func() {
+		mainURL = oldMainURL
+		userAgent = oldUserAgent
+		ja3 = oldJA3
+		timeout = oldTimeout
+		printErrors = oldPrintErrors
+		upstreamProxy = oldUpstreamProxy
+	}()
+
+	timeout = 30
+	printErrors = true
+	upstreamProxy = ""
+
+	server := httptest.NewServer(http.HandlerFunc(hello))
+	defer server.Close()
+
+	client := &http.Client{Timeout: 45 * time.Second}
+
+	directFingerprint := fetchScrapflyJA3(t, client, scrapflyJA3Endpoint+"/api/fp/ja3")
+
+	fingerprints := []smokeFingerprint{
+		{
+			name:         "firefox-linux",
+			userAgent:    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:87.0) Gecko/20100101 Firefox/87.0",
+			ja3:          "771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-51-57-47-53-10,0-23-65281-10-11-35-16-5-51-43-13-45-28-21,29-23-24-25-256-257,0",
+			ciphers:      "4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-51-57-47-53-10",
+			extensions:   "0-23-65281-10-11-35-16-5-51-43-13-45-28",
+			supported:    "29-23-24-25-256-257",
+			pointFormats: "0",
+		},
+		{
+			name:         "firefox-macos",
+			userAgent:    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0",
+			ja3:          "771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-156-157-47-53-10,0-23-65281-10-11-35-16-5-34-51-43-13-45-28-65037,29-23-24-25-256-257,0",
+			ciphers:      "4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-156-157-47-53-10",
+			extensions:   "0-23-65281-10-11-35-16-5-34-51-43-13-45-28-65037",
+			supported:    "29-23-24-25-256-257",
+			pointFormats: "0",
+		},
+	}
+
+	for i := range fingerprints {
+		fingerprint := &fingerprints[i]
+
+		t.Run(fingerprint.name+"/ja3", func(t *testing.T) {
+			mainURL = scrapflyJA3Endpoint
+			userAgent = fingerprint.userAgent
+			ja3 = fingerprint.ja3
+
+			proxiedFingerprint := fetchScrapflyJA3(t, client, server.URL+"/api/fp/ja3")
+			fingerprint.reportedJA3 = proxiedFingerprint.JA3
+			fingerprint.reportedJA3MD = proxiedFingerprint.JA3Digest
+
+			assert.NotEqual(t, directFingerprint.JA3Digest, proxiedFingerprint.JA3Digest)
+
+			// Scrapfly currently omits the TLS version and some ignored extensions from ja3.
+			// The remaining parts should still reflect the configured CycleTLS fingerprint.
+			ja3Parts := strings.Split(proxiedFingerprint.JA3, ",")
+			require.Len(t, ja3Parts, 5)
+			assert.Equal(t, fingerprint.ciphers, ja3Parts[1])
+			assert.Equal(t, fingerprint.extensions, ja3Parts[2])
+			assert.Equal(t, fingerprint.supported, ja3Parts[3])
+			assert.Equal(t, fingerprint.pointFormats, ja3Parts[4])
+		})
+
+		t.Run(fingerprint.name+"/user-agent", func(t *testing.T) {
+			mainURL = userAgentEchoEndpoint
+			userAgent = fingerprint.userAgent
+			ja3 = fingerprint.ja3
+
+			assert.Equal(t, fingerprint.userAgent, fetchUserAgent(t, client, server.URL+"/user-agent"))
+		})
+	}
+
+	require.NotEqual(t, fingerprints[0].reportedJA3, fingerprints[1].reportedJA3)
+	require.NotEqual(t, fingerprints[0].reportedJA3MD, fingerprints[1].reportedJA3MD)
 }

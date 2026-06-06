@@ -41,3 +41,18 @@ jobs:
 
       - name: Build
         run: go build .
+
+  external-smoke:
+    name: External Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Scrapfly JA3 smoke test
+        run: GOTLSPROXY_SCRAPFLY_SMOKE=1 go test -run TestScrapflyJA3Smoke -v
