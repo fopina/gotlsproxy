@@ -55,6 +55,19 @@ func printIfErrorCode(request *http.Request, response *cycletls.Response) {
 	}
 }
 
+func copyResponseHeaders(dst http.Header, src map[string]string) {
+	for name, value := range src {
+		switch {
+		case strings.EqualFold(name, "Content-Encoding"):
+			continue
+		case strings.EqualFold(name, "Content-Length"):
+			continue
+		}
+
+		dst.Add(name, value)
+	}
+}
+
 func hello(w http.ResponseWriter, req *http.Request) {
 	client := cycletls.Init()
 
@@ -93,11 +106,8 @@ func hello(w http.ResponseWriter, req *http.Request) {
 		printIfErrorCode(req, &response)
 	}
 
+	copyResponseHeaders(w.Header(), response.Headers)
 	w.WriteHeader(response.Status)
-	for name, h := range response.Headers {
-		w.Header().Add(name, h)
-	}
-
 	_, err = w.Write([]byte(response.Body))
 	if err != nil {
 		log.Printf("ERROR Proxy2Client: %v", err)

@@ -135,6 +135,34 @@ Error 404 (Not Found)!!1
 The requested URL /asdasdasd was not found on this server.  That’s all we know.`, cleanError)
 }
 
+func TestCopyResponseHeaders(t *testing.T) {
+	headers := make(http.Header)
+
+	copyResponseHeaders(headers, map[string]string{
+		"Content-Type":  "application/json",
+		"Set-Cookie":    "session=abc; HttpOnly",
+		"Cache-Control": "no-store",
+	})
+
+	assert.Equal(t, "application/json", headers.Get("Content-Type"))
+	assert.Equal(t, []string{"session=abc; HttpOnly"}, headers.Values("Set-Cookie"))
+	assert.Equal(t, "no-store", headers.Get("Cache-Control"))
+}
+
+func TestCopyResponseHeadersDropsDecodedBodyEntityHeaders(t *testing.T) {
+	headers := make(http.Header)
+
+	copyResponseHeaders(headers, map[string]string{
+		"content-encoding": "gzip",
+		"CONTENT-LENGTH":   "123",
+		"Content-Type":     "text/plain",
+	})
+
+	assert.Empty(t, headers.Values("Content-Encoding"))
+	assert.Empty(t, headers.Values("Content-Length"))
+	assert.Equal(t, "text/plain", headers.Get("Content-Type"))
+}
+
 func TestScrapflyJA3Smoke(t *testing.T) {
 	if os.Getenv("GOTLSPROXY_SCRAPFLY_SMOKE") != "1" {
 		t.Skip("set GOTLSPROXY_SCRAPFLY_SMOKE=1 to run Scrapfly JA3 smoke test")
