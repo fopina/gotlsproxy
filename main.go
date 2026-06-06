@@ -68,6 +68,61 @@ func copyResponseHeaders(dst http.Header, src map[string]string) {
 	}
 }
 
+var hopByHopRequestHeaders = map[string]struct{}{
+	"connection":          {},
+	"keep-alive":          {},
+	"proxy-authenticate":  {},
+	"proxy-authorization": {},
+	"proxy-connection":    {},
+	"te":                  {},
+	"trailer":             {},
+	"transfer-encoding":   {},
+	"upgrade":             {},
+}
+
+func requestConnectionHeaders(headers http.Header) map[string]struct{} {
+	connectionHeaders := make(map[string]struct{})
+
+	for _, headerValue := range headers.Values("Connection") {
+		for _, headerName := range strings.Split(headerValue, ",") {
+			headerName = strings.ToLower(strings.TrimSpace(headerName))
+			if headerName != "" {
+				connectionHeaders[headerName] = struct{}{}
+			}
+		}
+	}
+
+	return connectionHeaders
+}
+
+func copyRequestHeaders(src http.Header) map[string]string {
+	forwardedHeaders := make(map[string]string)
+	connectionHeaders := requestConnectionHeaders(src)
+
+	for name, values := range src {
+		headerName := strings.ToLower(name)
+		if strings.EqualFold(name, "User-Agent") {
+			continue
+		}
+		if _, ok := hopByHopRequestHeaders[headerName]; ok {
+			continue
+		}
+		if _, ok := connectionHeaders[headerName]; ok {
+			continue
+		}
+		if len(values) == 0 {
+			continue
+		}
+		// cycleTLS does not support multiple values for an header
+		if len(values) > 1 {
+			log.Printf("WARNING: header %s had all values dropped but 1", name)
+		}
+		forwardedHeaders[name] = values[0]
+	}
+
+	return forwardedHeaders
+}
+
 func hello(w http.ResponseWriter, req *http.Request) {
 	client := cycletls.Init()
 
@@ -77,23 +132,11 @@ func hello(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	forwardedHeaders := make(map[string]string)
-	for k, v := range req.Header {
-		if k == "User-Agent" {
-			continue
-		}
-		// cycleTLS does not support multiple values for an header
-		if len(v) > 1 {
-			log.Printf("WARNING: header %s had all values dropped but 1", k)
-		}
-		forwardedHeaders[k] = v[0]
-	}
-
 	response, err := client.Do(fmt.Sprintf("%s%s", mainURL, req.URL), cycletls.Options{
 		Body:      string(body),
 		Ja3:       ja3,
 		UserAgent: userAgent,
-		Headers:   forwardedHeaders,
+		Headers:   copyRequestHeaders(req.Header),
 		Timeout:   timeout,
 		Proxy:     upstreamProxy,
 	}, req.Method)
