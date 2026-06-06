@@ -38,6 +38,12 @@ $ docker run --rm ghcr.io/fopina/gotlsproxy:0.3 -version
 0.3
 ```
 
+### Response handling
+
+`gotlsproxy` uses CycleTLS for upstream requests. CycleTLS may decode compressed upstream response bodies before returning them to the proxy, so responses sent back to clients are the decoded body, not necessarily the original wire-encoded bytes. With the current CycleTLS version, `gzip`, `deflate`, `br`, and `brotli` response encodings are decoded when advertised by the upstream `Content-Encoding` header.
+
+Because of that, `gotlsproxy` forwards upstream response headers except `Content-Encoding` and `Content-Length`. Those two headers describe the original upstream representation and can become stale after decoding; Go's HTTP server will frame the response body sent to the client.
+
 ### Validation
 
 We can use an online service to validate that JA3 fingerprint does change, such as https://ja3.zone/check
