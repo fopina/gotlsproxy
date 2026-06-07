@@ -13,13 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6.4.0
         with:
-          go-version-file: go.mod
+          go-version: "1.26.4"
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@v9.2.1
         with:
           version: v2.12.2
           args: --timeout 5m
@@ -29,30 +29,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6.4.0
         with:
-          go-version-file: go.mod
+          go-version: "1.26.4"
 
       - name: Test
-        run: go test .
+        run: go test ./...
+
+      - name: Race test
+        run: go test -race ./...
+
+      - name: Vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
       - name: Build
-        run: go build .
+        run: go build ./...
 
   external-smoke:
     name: External Smoke Test
     runs-on: ubuntu-latest
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6.4.0
         with:
-          go-version-file: go.mod
+          go-version: "1.26.4"
 
       - name: Scrapfly JA3 smoke test
         run: GOTLSPROXY_SCRAPFLY_SMOKE=1 go test -run TestScrapflyJA3Smoke -v

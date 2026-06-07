@@ -68,4 +68,4 @@ docker_manifests:
       - ghcr.io/fopina/{{.ProjectName}}:{{ .Version }}-arm64
       - ghcr.io/fopina/{{.ProjectName}}:{{ .Version }}-amd64
   - <<: *manifest-ghcrdef
-    name_template: ghcr.io/fopina/{{.ProjectName}}:{{ .Version }}
+    name_template: ghcr.io/fopina/{{.ProjectName}}:latest
