@@ -1,9 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
-	"log"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Danny-Dasilva/CycleTLS/cycletls"
+	fhttp "github.com/Danny-Dasilva/fhttp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -38,6 +37,12 @@ type smokeFingerprint struct {
 	pointFormats  string
 	reportedJA3   string
 	reportedJA3MD string
+}
+
+type roundTripFunc func(*fhttp.Request) (*fhttp.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *fhttp.Request) (*fhttp.Response, error) {
+	return fn(req)
 }
 
 func fetchScrapflyJA3(t *testing.T, client *http.Client, url string) scrapflyJA3Response {
@@ -73,75 +78,13 @@ func fetchUserAgent(t *testing.T, client *http.Client, url string) string {
 	return echoed.UserAgent
 }
 
-func TestPrintIfErrorCode200(t *testing.T) {
-	var buf bytes.Buffer
-	log.SetFlags(0)
-	log.SetOutput(&buf)
-	defer func() {
-		log.SetOutput(os.Stderr)
-	}()
-
-	var response = cycletls.Response{
-		RequestID: "1",
-		Status:    200,
-		Body:      "test",
-		Headers:   nil,
-	}
-	printIfErrorCode(nil, &response)
-	assert.Equal(t, "", buf.String())
-}
-
-func TestPrintIfErrorCode400(t *testing.T) {
-	var buf bytes.Buffer
-	log.SetFlags(0)
-	log.SetOutput(&buf)
-	defer func() {
-		log.SetOutput(os.Stderr)
-	}()
-
-	var response = cycletls.Response{
-		RequestID: "1",
-		Status:    404,
-		Body:      `not found`,
-		Headers:   nil,
-	}
-	printIfErrorCode(nil, &response)
-	assert.Equal(t, `Response status 404
-== request ==
-<nil>
-== response ==
-{1 404 not found [] map[] [] }
-`, buf.String())
-}
-
-func TestCleanErrorResponseBody(t *testing.T) {
-	// random 404: curl https://www.google.com/asdasdasd
-	var raw = `<!DOCTYPE html>
-<html lang=en>
-<meta charset=utf-8>
-<meta name=viewport content="initial-scale=1, minimum-scale=1, width=device-width">
-<title>Error 404 (Not Found)!!1</title>
-<style>
-*{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:15px}body{margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px}* > body{background:url(//www.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px 0 22px;overflow:hidden}ins{color:#777;text-decoration:none}a img{border:0}@media screen and (max-width:772px){body{background:none;margin-top:0;max-width:none;padding-right:0}}#logo{background:url(//www.google.com/images/branding/googlelogo/1x/googlelogo_color_150x54dp.png) no-repeat;margin-left:-5px}@media only screen and (min-resolution:192dpi){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat 0% 0%/100% 100%;-moz-border-image:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) 0}}@media only screen and (-webkit-min-device-pixel-ratio:2){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat;-webkit-background-size:100% 100%}}#logo{display:inline-block;height:54px;width:150px}
-</style>
-<script src="wtv">alert(123)</script>
-<a href=//www.google.com/><span id=logo aria-label=Google></span></a>
-<p><b>404.</b> <ins>That’s an error.</ins>
-<p>The requested URL <code>/asdasdasd</code> was not found on this server.  <ins>That’s all we know.</ins>`
-	var cleanError = cleanErrorResponseBody(raw)
-	assert.Equal(t, `
-Error 404 (Not Found)!!1
-404. That’s an error.
-The requested URL /asdasdasd was not found on this server.  That’s all we know.`, cleanError)
-}
-
 func TestCopyResponseHeaders(t *testing.T) {
 	headers := make(http.Header)
 
-	copyResponseHeaders(headers, map[string]string{
-		"Content-Type":  "application/json",
-		"Set-Cookie":    "session=abc; HttpOnly",
-		"Cache-Control": "no-store",
+	copyResponseHeaders(headers, fhttp.Header{
+		"Content-Type":  []string{"application/json"},
+		"Set-Cookie":    []string{"session=abc; HttpOnly"},
+		"Cache-Control": []string{"no-store"},
 	})
 
 	assert.Equal(t, "application/json", headers.Get("Content-Type"))
@@ -149,17 +92,17 @@ func TestCopyResponseHeaders(t *testing.T) {
 	assert.Equal(t, "no-store", headers.Get("Cache-Control"))
 }
 
-func TestCopyResponseHeadersDropsDecodedBodyEntityHeaders(t *testing.T) {
+func TestCopyResponseHeadersPreservesEntityHeadersForStreamingResponse(t *testing.T) {
 	headers := make(http.Header)
 
-	copyResponseHeaders(headers, map[string]string{
-		"content-encoding": "gzip",
-		"CONTENT-LENGTH":   "123",
-		"Content-Type":     "text/plain",
+	copyResponseHeaders(headers, fhttp.Header{
+		"Content-Encoding": []string{"gzip"},
+		"Content-Length":   []string{"123"},
+		"Content-Type":     []string{"text/plain"},
 	})
 
-	assert.Empty(t, headers.Values("Content-Encoding"))
-	assert.Empty(t, headers.Values("Content-Length"))
+	assert.Equal(t, "gzip", headers.Get("Content-Encoding"))
+	assert.Equal(t, "123", headers.Get("Content-Length"))
 	assert.Equal(t, "text/plain", headers.Get("Content-Type"))
 }
 
@@ -233,6 +176,87 @@ func TestCopyRequestHeadersKeepsAllowedHopByHopHeaders(t *testing.T) {
 	assert.Equal(t, "keep", forwardedHeaders["X-Forward-Me"])
 	assert.NotContains(t, forwardedHeaders, "Connection")
 	assert.NotContains(t, forwardedHeaders, "Upgrade")
+}
+
+func TestHelloStreamsUpstreamResponse(t *testing.T) {
+	oldMainURL := mainURL
+	oldUserAgent := userAgent
+	oldJA3 := ja3
+	oldTimeout := timeout
+	oldPrintErrors := printErrors
+	oldUpstreamProxy := upstreamProxy
+	oldNewHTTPClient := newHTTPClient
+	defer func() {
+		mainURL = oldMainURL
+		userAgent = oldUserAgent
+		ja3 = oldJA3
+		timeout = oldTimeout
+		printErrors = oldPrintErrors
+		upstreamProxy = oldUpstreamProxy
+		newHTTPClient = oldNewHTTPClient
+	}()
+
+	firstChunkWritten := make(chan struct{})
+	allowSecondChunk := make(chan struct{})
+	responseBodyReader, responseBodyWriter := io.Pipe()
+	newHTTPClient = func() (*fhttp.Client, error) {
+		return &fhttp.Client{Transport: roundTripFunc(func(_ *fhttp.Request) (*fhttp.Response, error) {
+			go func() {
+				_, err := responseBodyWriter.Write([]byte("first"))
+				require.NoError(t, err)
+				close(firstChunkWritten)
+				<-allowSecondChunk
+				_, err = responseBodyWriter.Write([]byte("second"))
+				require.NoError(t, err)
+				require.NoError(t, responseBodyWriter.Close())
+			}()
+			return &fhttp.Response{
+				Status:        "200 OK",
+				StatusCode:    http.StatusOK,
+				Proto:         "HTTP/1.1",
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        fhttp.Header{"Content-Type": []string{"text/plain"}},
+				Body:          responseBodyReader,
+				ContentLength: -1,
+			}, nil
+		})}, nil
+	}
+
+	mainURL = "http://example.test"
+	userAgent = "gotlsproxy-test"
+	ja3 = ""
+	timeout = 10
+	printErrors = false
+	upstreamProxy = ""
+
+	recorder := httptest.NewRecorder()
+	handlerDone := make(chan struct{})
+	go func() {
+		hello(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+		close(handlerDone)
+	}()
+
+	<-firstChunkWritten
+
+	require.Eventually(t, func() bool {
+		return recorder.Body.String() == "first"
+	}, time.Second, 10*time.Millisecond)
+
+	select {
+	case <-handlerDone:
+		close(allowSecondChunk)
+		t.Fatal("handler completed before upstream stream completed")
+	default:
+	}
+
+	close(allowSecondChunk)
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not complete after upstream stream completed")
+	}
+	assert.Equal(t, "firstsecond", recorder.Body.String())
 }
 
 func TestHeaderNamesSet(t *testing.T) {

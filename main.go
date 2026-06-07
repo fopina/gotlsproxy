@@ -1,16 +1,25 @@
 package main
 
 import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"regexp"
 	"strings"
+	"time"
 
 	"github.com/Danny-Dasilva/CycleTLS/cycletls"
+	fhttp "github.com/Danny-Dasilva/fhttp"
+	"golang.org/x/net/proxy"
+	"h12.io/socks"
 )
 
 var version string = "DEV"
@@ -23,49 +32,31 @@ var timeout int
 var printErrors bool
 var upstreamProxy string
 var keepRequestHeaders headerNames
+var newHTTPClient = newCycleTLSHTTPClient
 
-func writeError(w http.ResponseWriter, err error) {
-	w.WriteHeader(500)
+func writeError(w http.ResponseWriter, status int, err error) {
+	w.WriteHeader(status)
 	_, errWrite := w.Write([]byte(err.Error()))
 	if errWrite != nil {
 		log.Printf("ERROR Proxy2Client: %v", errWrite)
 	}
 }
 
-var htmlTagStripper = regexp.MustCompile(`<.*?>`)
-var htmlStyleScriptStripper = regexp.MustCompile(`(?s)<(style|script)\b.*>(.*?)</(style|script)>`)
-var newlineStripper = regexp.MustCompile(`(?s)\n+`)
-
-func cleanErrorResponseBody(body string) string {
-	return newlineStripper.ReplaceAllString(
-		htmlTagStripper.ReplaceAllString(
-			htmlStyleScriptStripper.ReplaceAllString(body, ""),
-			"",
-		),
-		"\n",
-	)
-}
-
-func printIfErrorCode(request *http.Request, response *cycletls.Response) {
-	if response.Status >= 400 {
-		log.Printf("Response status %d", response.Status)
+func printIfHTTPErrorCode(request *http.Request, response *fhttp.Response) {
+	if response.StatusCode >= 400 {
+		log.Printf("Response status %d", response.StatusCode)
 		log.Printf("== request ==")
 		log.Printf("%v", request)
 		log.Printf("== response ==")
-		log.Printf("%v", cycletls.Response{RequestID: response.RequestID, Status: response.Status, Body: cleanErrorResponseBody(response.Body), Headers: response.Headers})
+		log.Printf("%s %s", response.Proto, response.Status)
 	}
 }
 
-func copyResponseHeaders(dst http.Header, src map[string]string) {
-	for name, value := range src {
-		switch {
-		case strings.EqualFold(name, "Content-Encoding"):
-			continue
-		case strings.EqualFold(name, "Content-Length"):
-			continue
+func copyResponseHeaders(dst http.Header, src fhttp.Header) {
+	for name, values := range src {
+		for _, value := range values {
+			dst.Add(name, value)
 		}
-
-		dst.Add(name, value)
 	}
 }
 
@@ -150,35 +141,169 @@ func copyRequestHeaders(src http.Header, keepHeaders map[string]struct{}) map[st
 	return forwardedHeaders
 }
 
+type contextDialerFunc func(context.Context, string, string) (net.Conn, error)
+
+func (fn contextDialerFunc) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return fn(ctx, network, address)
+}
+
+func defaultProxyPort(scheme string) string {
+	switch scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	case "socks4", "socks5", "socks5h":
+		return "1080"
+	default:
+		return ""
+	}
+}
+
+func proxyAddress(proxyURL *url.URL) string {
+	if proxyURL.Port() != "" {
+		return proxyURL.Host
+	}
+	return net.JoinHostPort(proxyURL.Hostname(), defaultProxyPort(proxyURL.Scheme))
+}
+
+func newHTTPConnectDialer(proxyURL *url.URL) proxy.ContextDialer {
+	proxyAddr := proxyAddress(proxyURL)
+	return contextDialerFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
+		var dialer net.Dialer
+		conn, err := dialer.DialContext(ctx, network, proxyAddr)
+		if err != nil {
+			return nil, err
+		}
+
+		if proxyURL.Scheme == "https" {
+			tlsConn := tls.Client(conn, &tls.Config{ServerName: proxyURL.Hostname()})
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			conn = tlsConn
+		}
+
+		connectRequest := &http.Request{
+			Method: "CONNECT",
+			URL:    &url.URL{Opaque: address},
+			Host:   address,
+			Header: make(http.Header),
+		}
+		connectRequest.Header.Set("User-Agent", userAgent)
+		if proxyURL.User != nil && proxyURL.User.Username() != "" {
+			password, _ := proxyURL.User.Password()
+			token := base64.StdEncoding.EncodeToString([]byte(proxyURL.User.Username() + ":" + password))
+			connectRequest.Header.Set("Proxy-Authorization", "Basic "+token)
+		}
+
+		if err := connectRequest.Write(conn); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		response, err := http.ReadResponse(bufio.NewReader(conn), connectRequest)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		if response.StatusCode != http.StatusOK {
+			_ = response.Body.Close()
+			_ = conn.Close()
+			return nil, fmt.Errorf("proxy responded with non-200 status: %s", response.Status)
+		}
+		_ = response.Body.Close()
+		return conn, nil
+	})
+}
+
+func upstreamDialer() (proxy.ContextDialer, error) {
+	if upstreamProxy == "" {
+		return proxy.Direct, nil
+	}
+
+	proxyURL, err := url.Parse(upstreamProxy)
+	if err != nil {
+		return nil, err
+	}
+
+	switch proxyURL.Scheme {
+	case "http", "https":
+		if proxyURL.Host == "" {
+			return nil, fmt.Errorf("invalid proxy URL %q", upstreamProxy)
+		}
+		return newHTTPConnectDialer(proxyURL), nil
+	case "socks4":
+		dialer := socks.DialSocksProxy(socks.SOCKS4, proxyAddress(proxyURL))
+		return contextDialerFunc(func(_ context.Context, network, address string) (net.Conn, error) {
+			return dialer(network, address)
+		}), nil
+	case "socks5", "socks5h":
+		dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+		if err != nil {
+			return nil, err
+		}
+		contextDialer, ok := dialer.(proxy.ContextDialer)
+		if !ok {
+			return nil, fmt.Errorf("proxy %s does not support context dialing", upstreamProxy)
+		}
+		return contextDialer, nil
+	case "":
+		return nil, fmt.Errorf("specify proxy scheme explicitly")
+	default:
+		return nil, fmt.Errorf("scheme %s is not supported", proxyURL.Scheme)
+	}
+}
+
+func newCycleTLSHTTPClient() (*fhttp.Client, error) {
+	dialer, err := upstreamDialer()
+	if err != nil {
+		return nil, err
+	}
+	return &fhttp.Client{
+		Transport: cycletls.NewTransportWithProxy(ja3, userAgent, dialer),
+		Timeout:   time.Duration(timeout) * time.Second,
+	}, nil
+}
+
+func copyRequestHeadersToFHTTP(dst fhttp.Header, src http.Header, keepHeaders map[string]struct{}) {
+	for name, value := range copyRequestHeaders(src, keepHeaders) {
+		dst.Set(name, value)
+	}
+}
+
 func hello(w http.ResponseWriter, req *http.Request) {
-	client := cycletls.Init()
-
-	body, err := io.ReadAll(req.Body)
+	client, err := newHTTPClient()
 	if err != nil {
-		writeError(w, err)
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
-	response, err := client.Do(fmt.Sprintf("%s%s", mainURL, req.URL), cycletls.Options{
-		Body:      string(body),
-		Ja3:       ja3,
-		UserAgent: userAgent,
-		Headers:   copyRequestHeaders(req.Header, keepRequestHeaders.allowList()),
-		Timeout:   timeout,
-		Proxy:     upstreamProxy,
-	}, req.Method)
+	upstreamRequest, err := fhttp.NewRequestWithContext(req.Context(), req.Method, fmt.Sprintf("%s%s", mainURL, req.URL), req.Body)
 	if err != nil {
-		writeError(w, err)
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	copyRequestHeadersToFHTTP(upstreamRequest.Header, req.Header, keepRequestHeaders.allowList())
+
+	response, err := client.Do(upstreamRequest)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			log.Printf("ERROR UpstreamResponseClose: %v", err)
+		}
+	}()
 
 	if printErrors {
-		printIfErrorCode(req, &response)
+		printIfHTTPErrorCode(req, response)
 	}
 
-	copyResponseHeaders(w.Header(), response.Headers)
-	w.WriteHeader(response.Status)
-	_, err = w.Write([]byte(response.Body))
+	copyResponseHeaders(w.Header(), response.Header)
+	w.WriteHeader(response.StatusCode)
+	_, err = io.Copy(w, response.Body)
 	if err != nil {
 		log.Printf("ERROR Proxy2Client: %v", err)
 	}
