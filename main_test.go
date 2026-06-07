@@ -179,61 +179,44 @@ func TestCopyRequestHeadersKeepsAllowedHopByHopHeaders(t *testing.T) {
 }
 
 func TestHelloStreamsUpstreamResponse(t *testing.T) {
-	oldMainURL := mainURL
-	oldUserAgent := userAgent
-	oldJA3 := ja3
-	oldTimeout := timeout
-	oldPrintErrors := printErrors
-	oldUpstreamProxy := upstreamProxy
-	oldNewHTTPClient := newHTTPClient
-	defer func() {
-		mainURL = oldMainURL
-		userAgent = oldUserAgent
-		ja3 = oldJA3
-		timeout = oldTimeout
-		printErrors = oldPrintErrors
-		upstreamProxy = oldUpstreamProxy
-		newHTTPClient = oldNewHTTPClient
-	}()
-
 	firstChunkWritten := make(chan struct{})
 	allowSecondChunk := make(chan struct{})
 	responseBodyReader, responseBodyWriter := io.Pipe()
-	newHTTPClient = func() (*fhttp.Client, error) {
-		return &fhttp.Client{Transport: roundTripFunc(func(_ *fhttp.Request) (*fhttp.Response, error) {
-			go func() {
-				_, err := responseBodyWriter.Write([]byte("first"))
-				require.NoError(t, err)
-				close(firstChunkWritten)
-				<-allowSecondChunk
-				_, err = responseBodyWriter.Write([]byte("second"))
-				require.NoError(t, err)
-				require.NoError(t, responseBodyWriter.Close())
-			}()
-			return &fhttp.Response{
-				Status:        "200 OK",
-				StatusCode:    http.StatusOK,
-				Proto:         "HTTP/1.1",
-				ProtoMajor:    1,
-				ProtoMinor:    1,
-				Header:        fhttp.Header{"Content-Type": []string{"text/plain"}},
-				Body:          responseBodyReader,
-				ContentLength: -1,
-			}, nil
-		})}, nil
-	}
 
-	mainURL = "http://example.test"
-	userAgent = "gotlsproxy-test"
-	ja3 = ""
-	timeout = 10
-	printErrors = false
-	upstreamProxy = ""
+	handler := &proxy{
+		mainURL:       "http://example.test",
+		userAgent:     "gotlsproxy-test",
+		timeout:       10,
+		upstreamProxy: "",
+		newHTTPClient: func() (*fhttp.Client, error) {
+			return &fhttp.Client{Transport: roundTripFunc(func(_ *fhttp.Request) (*fhttp.Response, error) {
+				go func() {
+					_, err := responseBodyWriter.Write([]byte("first"))
+					require.NoError(t, err)
+					close(firstChunkWritten)
+					<-allowSecondChunk
+					_, err = responseBodyWriter.Write([]byte("second"))
+					require.NoError(t, err)
+					require.NoError(t, responseBodyWriter.Close())
+				}()
+				return &fhttp.Response{
+					Status:        "200 OK",
+					StatusCode:    http.StatusOK,
+					Proto:         "HTTP/1.1",
+					ProtoMajor:    1,
+					ProtoMinor:    1,
+					Header:        fhttp.Header{"Content-Type": []string{"text/plain"}},
+					Body:          responseBodyReader,
+					ContentLength: -1,
+				}, nil
+			})}, nil
+		},
+	}
 
 	recorder := httptest.NewRecorder()
 	handlerDone := make(chan struct{})
 	go func() {
-		hello(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 		close(handlerDone)
 	}()
 
@@ -284,26 +267,13 @@ func TestScrapflyJA3Smoke(t *testing.T) {
 		t.Skip("set GOTLSPROXY_SCRAPFLY_SMOKE=1 to run Scrapfly JA3 smoke test")
 	}
 
-	oldMainURL := mainURL
-	oldUserAgent := userAgent
-	oldJA3 := ja3
-	oldTimeout := timeout
-	oldPrintErrors := printErrors
-	oldUpstreamProxy := upstreamProxy
-	defer func() {
-		mainURL = oldMainURL
-		userAgent = oldUserAgent
-		ja3 = oldJA3
-		timeout = oldTimeout
-		printErrors = oldPrintErrors
-		upstreamProxy = oldUpstreamProxy
-	}()
+	handler := &proxy{
+		timeout:       30,
+		printErrors:   true,
+		upstreamProxy: "",
+	}
 
-	timeout = 30
-	printErrors = true
-	upstreamProxy = ""
-
-	server := httptest.NewServer(http.HandlerFunc(hello))
+	server := httptest.NewServer(handler)
 	defer server.Close()
 
 	client := &http.Client{Timeout: 45 * time.Second}
@@ -335,9 +305,9 @@ func TestScrapflyJA3Smoke(t *testing.T) {
 		fingerprint := &fingerprints[i]
 
 		t.Run(fingerprint.name+"/ja3", func(t *testing.T) {
-			mainURL = scrapflyJA3Endpoint
-			userAgent = fingerprint.userAgent
-			ja3 = fingerprint.ja3
+			handler.mainURL = scrapflyJA3Endpoint
+			handler.userAgent = fingerprint.userAgent
+			handler.ja3 = fingerprint.ja3
 
 			proxiedFingerprint := fetchScrapflyJA3(t, client, server.URL+"/api/fp/ja3")
 			fingerprint.reportedJA3 = proxiedFingerprint.JA3
@@ -356,9 +326,9 @@ func TestScrapflyJA3Smoke(t *testing.T) {
 		})
 
 		t.Run(fingerprint.name+"/user-agent", func(t *testing.T) {
-			mainURL = userAgentEchoEndpoint
-			userAgent = fingerprint.userAgent
-			ja3 = fingerprint.ja3
+			handler.mainURL = userAgentEchoEndpoint
+			handler.userAgent = fingerprint.userAgent
+			handler.ja3 = fingerprint.ja3
 
 			assert.Equal(t, fingerprint.userAgent, fetchUserAgent(t, client, server.URL+"/user-agent"))
 		})
