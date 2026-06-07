@@ -17,6 +17,8 @@ Flags:
     	Listening address to bind to (default "127.0.0.1:8888")
   -ja3 string
     	JA3 token to spoof, should align with user-agent (default "771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-51-57-47-53-10,0-23-65281-10-11-35-16-5-51-43-13-45-28-21,29-23-24-25-256-257,0")
+  -keep-request-header value
+    	Request header to forward even if normally stripped; can be used multiple times
   -print-errors
     	Print request and response when an error (4xx and 5xx) is returned from upstream server
   -timeout int
@@ -43,6 +45,18 @@ $ docker run --rm ghcr.io/fopina/gotlsproxy:0.3 -version
 `gotlsproxy` uses CycleTLS for upstream requests. CycleTLS may decode compressed upstream response bodies before returning them to the proxy, so responses sent back to clients are the decoded body, not necessarily the original wire-encoded bytes. With the current CycleTLS version, `gzip`, `deflate`, `br`, and `brotli` response encodings are decoded when advertised by the upstream `Content-Encoding` header.
 
 Because of that, `gotlsproxy` forwards upstream response headers except `Content-Encoding` and `Content-Length`. Those two headers describe the original upstream representation and can become stale after decoding; Go's HTTP server will frame the response body sent to the client.
+
+### Request header handling
+
+`gotlsproxy` strips hop-by-hop and proxy-sensitive request headers before forwarding requests upstream. This includes `Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, and any custom headers named by the request `Connection` header.
+
+If an upstream server requires one of those headers, use `-keep-request-header` to forward it anyway. The flag can be used multiple times:
+
+```
+$ gotlsproxy -keep-request-header Upgrade -keep-request-header Connection https://example.com/
+```
+
+The client `User-Agent` header is still not forwarded; use `-ua` to control the upstream user agent.
 
 ### Validation
 

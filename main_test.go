@@ -163,6 +163,98 @@ func TestCopyResponseHeadersDropsDecodedBodyEntityHeaders(t *testing.T) {
 	assert.Equal(t, "text/plain", headers.Get("Content-Type"))
 }
 
+func TestCopyRequestHeaders(t *testing.T) {
+	headers := http.Header{
+		"Accept":        []string{"application/json"},
+		"Authorization": []string{"Bearer token"},
+		"X-Trace-Id":    []string{"abc123"},
+		"User-Agent":    []string{"curl/8.0"},
+	}
+
+	forwardedHeaders := copyRequestHeaders(headers, nil)
+
+	assert.Equal(t, "application/json", forwardedHeaders["Accept"])
+	assert.Equal(t, "Bearer token", forwardedHeaders["Authorization"])
+	assert.Equal(t, "abc123", forwardedHeaders["X-Trace-Id"])
+	assert.NotContains(t, forwardedHeaders, "User-Agent")
+}
+
+func TestCopyRequestHeadersDropsHopByHopHeaders(t *testing.T) {
+	headers := http.Header{
+		"Connection":          []string{"keep-alive"},
+		"Keep-Alive":          []string{"timeout=5"},
+		"Proxy-Authenticate":  []string{"Basic"},
+		"Proxy-Authorization": []string{"Basic credentials"},
+		"Proxy-Connection":    []string{"keep-alive"},
+		"Te":                  []string{"trailers"},
+		"Trailer":             []string{"Expires"},
+		"Transfer-Encoding":   []string{"chunked"},
+		"Upgrade":             []string{"websocket"},
+		"X-Forward-Me":        []string{"yes"},
+	}
+
+	forwardedHeaders := copyRequestHeaders(headers, nil)
+
+	assert.Equal(t, map[string]string{"X-Forward-Me": "yes"}, forwardedHeaders)
+}
+
+func TestCopyRequestHeadersDropsConnectionNamedHeaders(t *testing.T) {
+	headers := http.Header{
+		"Connection":    []string{"X-Debug, x-remove-me"},
+		"X-Debug":       []string{"debug"},
+		"X-Remove-Me":   []string{"remove"},
+		"X-Forward-Me":  []string{"keep"},
+		"Cache-Control": []string{"no-cache"},
+	}
+
+	forwardedHeaders := copyRequestHeaders(headers, nil)
+
+	assert.Equal(t, "keep", forwardedHeaders["X-Forward-Me"])
+	assert.Equal(t, "no-cache", forwardedHeaders["Cache-Control"])
+	assert.NotContains(t, forwardedHeaders, "Connection")
+	assert.NotContains(t, forwardedHeaders, "X-Debug")
+	assert.NotContains(t, forwardedHeaders, "X-Remove-Me")
+}
+
+func TestCopyRequestHeadersKeepsAllowedHopByHopHeaders(t *testing.T) {
+	headers := http.Header{
+		"Connection":   []string{"X-Debug"},
+		"Keep-Alive":   []string{"timeout=5"},
+		"X-Debug":      []string{"debug"},
+		"Upgrade":      []string{"websocket"},
+		"X-Forward-Me": []string{"keep"},
+	}
+
+	keepHeaders := headerNames{"keep-alive", "X-Debug"}.allowList()
+	forwardedHeaders := copyRequestHeaders(headers, keepHeaders)
+
+	assert.Equal(t, "timeout=5", forwardedHeaders["Keep-Alive"])
+	assert.Equal(t, "debug", forwardedHeaders["X-Debug"])
+	assert.Equal(t, "keep", forwardedHeaders["X-Forward-Me"])
+	assert.NotContains(t, forwardedHeaders, "Connection")
+	assert.NotContains(t, forwardedHeaders, "Upgrade")
+}
+
+func TestHeaderNamesSet(t *testing.T) {
+	var headers headerNames
+
+	require.NoError(t, headers.Set(" Keep-Alive "))
+	require.NoError(t, headers.Set("X-Debug"))
+
+	assert.Equal(t, "Keep-Alive,X-Debug", headers.String())
+	assert.Equal(t, map[string]struct{}{
+		"keep-alive": {},
+		"x-debug":    {},
+	}, headers.allowList())
+}
+
+func TestHeaderNamesSetRejectsEmptyName(t *testing.T) {
+	var headers headerNames
+
+	require.Error(t, headers.Set(" "))
+	assert.Empty(t, headers)
+}
+
 func TestScrapflyJA3Smoke(t *testing.T) {
 	if os.Getenv("GOTLSPROXY_SCRAPFLY_SMOKE") != "1" {
 		t.Skip("set GOTLSPROXY_SCRAPFLY_SMOKE=1 to run Scrapfly JA3 smoke test")
