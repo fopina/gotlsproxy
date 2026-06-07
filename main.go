@@ -18,21 +18,22 @@ import (
 
 	"github.com/Danny-Dasilva/CycleTLS/cycletls"
 	fhttp "github.com/Danny-Dasilva/fhttp"
-	"golang.org/x/net/proxy"
+	xproxy "golang.org/x/net/proxy"
 	"h12.io/socks"
 )
 
 var version string = "DEV"
 
-var mainURL string
-var userAgent string
-var ja3 string
-var listenAddress string
-var timeout int
-var printErrors bool
-var upstreamProxy string
-var keepRequestHeaders headerNames
-var newHTTPClient = newCycleTLSHTTPClient
+type proxy struct {
+	mainURL            string
+	userAgent          string
+	ja3                string
+	timeout            int
+	printErrors        bool
+	upstreamProxy      string
+	keepRequestHeaders headerNames
+	newHTTPClient      func() (*fhttp.Client, error)
+}
 
 func writeError(w http.ResponseWriter, status int, err error) {
 	w.WriteHeader(status)
@@ -167,7 +168,7 @@ func proxyAddress(proxyURL *url.URL) string {
 	return net.JoinHostPort(proxyURL.Hostname(), defaultProxyPort(proxyURL.Scheme))
 }
 
-func newHTTPConnectDialer(proxyURL *url.URL) proxy.ContextDialer {
+func (handler *proxy) newHTTPConnectDialer(proxyURL *url.URL) xproxy.ContextDialer {
 	proxyAddr := proxyAddress(proxyURL)
 	return contextDialerFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
 		var dialer net.Dialer
@@ -191,7 +192,7 @@ func newHTTPConnectDialer(proxyURL *url.URL) proxy.ContextDialer {
 			Host:   address,
 			Header: make(http.Header),
 		}
-		connectRequest.Header.Set("User-Agent", userAgent)
+		connectRequest.Header.Set("User-Agent", handler.userAgent)
 		if proxyURL.User != nil && proxyURL.User.Username() != "" {
 			password, _ := proxyURL.User.Password()
 			token := base64.StdEncoding.EncodeToString([]byte(proxyURL.User.Username() + ":" + password))
@@ -217,12 +218,12 @@ func newHTTPConnectDialer(proxyURL *url.URL) proxy.ContextDialer {
 	})
 }
 
-func upstreamDialer() (proxy.ContextDialer, error) {
-	if upstreamProxy == "" {
-		return proxy.Direct, nil
+func (handler *proxy) upstreamDialer() (xproxy.ContextDialer, error) {
+	if handler.upstreamProxy == "" {
+		return xproxy.Direct, nil
 	}
 
-	proxyURL, err := url.Parse(upstreamProxy)
+	proxyURL, err := url.Parse(handler.upstreamProxy)
 	if err != nil {
 		return nil, err
 	}
@@ -230,22 +231,22 @@ func upstreamDialer() (proxy.ContextDialer, error) {
 	switch proxyURL.Scheme {
 	case "http", "https":
 		if proxyURL.Host == "" {
-			return nil, fmt.Errorf("invalid proxy URL %q", upstreamProxy)
+			return nil, fmt.Errorf("invalid proxy URL %q", handler.upstreamProxy)
 		}
-		return newHTTPConnectDialer(proxyURL), nil
+		return handler.newHTTPConnectDialer(proxyURL), nil
 	case "socks4":
 		dialer := socks.DialSocksProxy(socks.SOCKS4, proxyAddress(proxyURL))
 		return contextDialerFunc(func(_ context.Context, network, address string) (net.Conn, error) {
 			return dialer(network, address)
 		}), nil
 	case "socks5", "socks5h":
-		dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+		dialer, err := xproxy.FromURL(proxyURL, xproxy.Direct)
 		if err != nil {
 			return nil, err
 		}
-		contextDialer, ok := dialer.(proxy.ContextDialer)
+		contextDialer, ok := dialer.(xproxy.ContextDialer)
 		if !ok {
-			return nil, fmt.Errorf("proxy %s does not support context dialing", upstreamProxy)
+			return nil, fmt.Errorf("proxy %s does not support context dialing", handler.upstreamProxy)
 		}
 		return contextDialer, nil
 	case "":
@@ -255,14 +256,14 @@ func upstreamDialer() (proxy.ContextDialer, error) {
 	}
 }
 
-func newCycleTLSHTTPClient() (*fhttp.Client, error) {
-	dialer, err := upstreamDialer()
+func (handler *proxy) newCycleTLSHTTPClient() (*fhttp.Client, error) {
+	dialer, err := handler.upstreamDialer()
 	if err != nil {
 		return nil, err
 	}
 	return &fhttp.Client{
-		Transport: cycletls.NewTransportWithProxy(ja3, userAgent, dialer),
-		Timeout:   time.Duration(timeout) * time.Second,
+		Transport: cycletls.NewTransportWithProxy(handler.ja3, handler.userAgent, dialer),
+		Timeout:   time.Duration(handler.timeout) * time.Second,
 	}, nil
 }
 
@@ -272,19 +273,24 @@ func copyRequestHeadersToFHTTP(dst fhttp.Header, src http.Header, keepHeaders ma
 	}
 }
 
-func hello(w http.ResponseWriter, req *http.Request) {
+func (handler *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	newHTTPClient := handler.newHTTPClient
+	if newHTTPClient == nil {
+		newHTTPClient = handler.newCycleTLSHTTPClient
+	}
+
 	client, err := newHTTPClient()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 
-	upstreamRequest, err := fhttp.NewRequestWithContext(req.Context(), req.Method, fmt.Sprintf("%s%s", mainURL, req.URL), req.Body)
+	upstreamRequest, err := fhttp.NewRequestWithContext(req.Context(), req.Method, fmt.Sprintf("%s%s", handler.mainURL, req.URL), req.Body)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	copyRequestHeadersToFHTTP(upstreamRequest.Header, req.Header, keepRequestHeaders.allowList())
+	copyRequestHeadersToFHTTP(upstreamRequest.Header, req.Header, handler.keepRequestHeaders.allowList())
 
 	response, err := client.Do(upstreamRequest)
 	if err != nil {
@@ -297,7 +303,7 @@ func hello(w http.ResponseWriter, req *http.Request) {
 		}
 	}()
 
-	if printErrors {
+	if handler.printErrors {
 		printIfHTTPErrorCode(req, response)
 	}
 
@@ -310,13 +316,16 @@ func hello(w http.ResponseWriter, req *http.Request) {
 }
 
 func main() {
-	flag.StringVar(&userAgent, "ua", "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:87.0) Gecko/20100101 Firefox/87.0", "User-Agent to spoof, should align with JA3 token")
-	flag.StringVar(&ja3, "ja3", "771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-51-57-47-53-10,0-23-65281-10-11-35-16-5-51-43-13-45-28-21,29-23-24-25-256-257,0", "JA3 token to spoof, should align with user-agent")
+	handler := &proxy{}
+	var listenAddress string
+
+	flag.StringVar(&handler.userAgent, "ua", "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:87.0) Gecko/20100101 Firefox/87.0", "User-Agent to spoof, should align with JA3 token")
+	flag.StringVar(&handler.ja3, "ja3", "771,4865-4867-4866-49195-52393-52392-49196-49200-49162-49161-49171-49172-51-57-47-53-10,0-23-65281-10-11-35-16-5-51-43-13-45-28-21,29-23-24-25-256-257,0", "JA3 token to spoof, should align with user-agent")
 	flag.StringVar(&listenAddress, "bind", "127.0.0.1:8888", "Listening address to bind to")
-	flag.StringVar(&upstreamProxy, "upstream-proxy", "", "Upstream proxy (if any required)")
-	flag.IntVar(&timeout, "timeout", 60, "Request timeout")
-	flag.BoolVar(&printErrors, "print-errors", false, "Print request and response when an error (4xx and 5xx) is returned from upstream server")
-	flag.Var(&keepRequestHeaders, "keep-request-header", "Request header to forward even if normally stripped; can be used multiple times")
+	flag.StringVar(&handler.upstreamProxy, "upstream-proxy", "", "Upstream proxy (if any required)")
+	flag.IntVar(&handler.timeout, "timeout", 60, "Request timeout")
+	flag.BoolVar(&handler.printErrors, "print-errors", false, "Print request and response when an error (4xx and 5xx) is returned from upstream server")
+	flag.Var(&handler.keepRequestHeaders, "keep-request-header", "Request header to forward even if normally stripped; can be used multiple times")
 	versionPtr := flag.Bool("version", false, "display version")
 
 	flag.Usage = func() {
@@ -342,11 +351,10 @@ Flags:
 		os.Exit(2)
 	}
 
-	mainURL = strings.TrimRight(flag.Arg(0), "/")
+	handler.mainURL = strings.TrimRight(flag.Arg(0), "/")
 
-	http.HandleFunc("/", hello)
-	log.Println("Up and running! All requests from http://" + listenAddress + " forwarded to " + mainURL)
-	err := http.ListenAndServe(listenAddress, nil)
+	log.Println("Up and running! All requests from http://" + listenAddress + " forwarded to " + handler.mainURL)
+	err := http.ListenAndServe(listenAddress, handler)
 	if err != nil {
 		log.Fatal(err)
 	}
