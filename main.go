@@ -22,6 +22,7 @@ var listenAddress string
 var timeout int
 var printErrors bool
 var upstreamProxy string
+var keepRequestHeaders headerNames
 
 func writeError(w http.ResponseWriter, err error) {
 	w.WriteHeader(500)
@@ -80,6 +81,30 @@ var hopByHopRequestHeaders = map[string]struct{}{
 	"upgrade":             {},
 }
 
+type headerNames []string
+
+func (headers *headerNames) String() string {
+	return strings.Join(*headers, ",")
+}
+
+func (headers *headerNames) Set(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fmt.Errorf("header name cannot be empty")
+	}
+
+	*headers = append(*headers, value)
+	return nil
+}
+
+func (headers headerNames) allowList() map[string]struct{} {
+	allowList := make(map[string]struct{}, len(headers))
+	for _, header := range headers {
+		allowList[strings.ToLower(header)] = struct{}{}
+	}
+	return allowList
+}
+
 func requestConnectionHeaders(headers http.Header) map[string]struct{} {
 	connectionHeaders := make(map[string]struct{})
 
@@ -95,7 +120,7 @@ func requestConnectionHeaders(headers http.Header) map[string]struct{} {
 	return connectionHeaders
 }
 
-func copyRequestHeaders(src http.Header) map[string]string {
+func copyRequestHeaders(src http.Header, keepHeaders map[string]struct{}) map[string]string {
 	forwardedHeaders := make(map[string]string)
 	connectionHeaders := requestConnectionHeaders(src)
 
@@ -104,11 +129,13 @@ func copyRequestHeaders(src http.Header) map[string]string {
 		if strings.EqualFold(name, "User-Agent") {
 			continue
 		}
-		if _, ok := hopByHopRequestHeaders[headerName]; ok {
-			continue
-		}
-		if _, ok := connectionHeaders[headerName]; ok {
-			continue
+		if _, keep := keepHeaders[headerName]; !keep {
+			if _, ok := hopByHopRequestHeaders[headerName]; ok {
+				continue
+			}
+			if _, ok := connectionHeaders[headerName]; ok {
+				continue
+			}
 		}
 		if len(values) == 0 {
 			continue
@@ -136,7 +163,7 @@ func hello(w http.ResponseWriter, req *http.Request) {
 		Body:      string(body),
 		Ja3:       ja3,
 		UserAgent: userAgent,
-		Headers:   copyRequestHeaders(req.Header),
+		Headers:   copyRequestHeaders(req.Header, keepRequestHeaders.allowList()),
 		Timeout:   timeout,
 		Proxy:     upstreamProxy,
 	}, req.Method)
@@ -164,6 +191,7 @@ func main() {
 	flag.StringVar(&upstreamProxy, "upstream-proxy", "", "Upstream proxy (if any required)")
 	flag.IntVar(&timeout, "timeout", 60, "Request timeout")
 	flag.BoolVar(&printErrors, "print-errors", false, "Print request and response when an error (4xx and 5xx) is returned from upstream server")
+	flag.Var(&keepRequestHeaders, "keep-request-header", "Request header to forward even if normally stripped; can be used multiple times")
 	versionPtr := flag.Bool("version", false, "display version")
 
 	flag.Usage = func() {
