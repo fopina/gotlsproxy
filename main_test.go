@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,6 +47,81 @@ type roundTripFunc func(*fhttp.Request) (*fhttp.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *fhttp.Request) (*fhttp.Response, error) {
 	return fn(req)
+}
+
+type lockedResponseRecorder struct {
+	header http.Header
+	body   bytes.Buffer
+	mu     sync.Mutex
+	code   int
+}
+
+func newLockedResponseRecorder() *lockedResponseRecorder {
+	return &lockedResponseRecorder{header: make(http.Header), code: http.StatusOK}
+}
+
+func (recorder *lockedResponseRecorder) Header() http.Header {
+	return recorder.header
+}
+
+func (recorder *lockedResponseRecorder) WriteHeader(statusCode int) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	recorder.code = statusCode
+}
+
+func (recorder *lockedResponseRecorder) Write(body []byte) (int, error) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	return recorder.body.Write(body)
+}
+
+func (recorder *lockedResponseRecorder) BodyString() string {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	return recorder.body.String()
+}
+
+func (recorder *lockedResponseRecorder) Code() int {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	return recorder.code
+}
+
+func newTestProxy(roundTrip func(*fhttp.Request) (*fhttp.Response, error)) *proxy {
+	return &proxy{
+		mainURL:       "https://upstream.example/base",
+		userAgent:     "gotlsproxy-test",
+		timeout:       10,
+		upstreamProxy: "",
+		newHTTPClient: func() (*fhttp.Client, error) {
+			return &fhttp.Client{Transport: roundTripFunc(roundTrip)}, nil
+		},
+	}
+}
+
+func newFHTTPResponse(statusCode int, headers fhttp.Header, body io.Reader) *fhttp.Response {
+	return &fhttp.Response{
+		Status:        fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
+		StatusCode:    statusCode,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        headers,
+		Body:          io.NopCloser(body),
+		ContentLength: -1,
+	}
+}
+
+func gzipBytes(t *testing.T, body string) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	_, err := writer.Write([]byte(body))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	return buf.Bytes()
 }
 
 func fetchScrapflyJA3(t *testing.T, client *http.Client, url string) scrapflyJA3Response {
@@ -178,6 +257,102 @@ func TestCopyRequestHeadersKeepsAllowedHopByHopHeaders(t *testing.T) {
 	assert.NotContains(t, forwardedHeaders, "Upgrade")
 }
 
+func TestServeHTTPForwardsPathQueryHeadersCookiesAndPostBody(t *testing.T) {
+	var upstreamMethod string
+	var upstreamURL string
+	var upstreamHeaders fhttp.Header
+	var upstreamBody string
+
+	handler := newTestProxy(func(req *fhttp.Request) (*fhttp.Response, error) {
+		var err error
+		upstreamMethod = req.Method
+		upstreamURL = req.URL.String()
+		upstreamHeaders = req.Header.Clone()
+		bodyBytes, err := io.ReadAll(req.Body)
+		require.NoError(t, err)
+		upstreamBody = string(bodyBytes)
+
+		return newFHTTPResponse(http.StatusOK, fhttp.Header{}, strings.NewReader("ok")), nil
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/items?search=a%20b&limit=10", strings.NewReader("payload=abc"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("X-Trace-Id", "trace-123")
+	request.Header.Set("User-Agent", "client-agent")
+	request.AddCookie(&http.Cookie{Name: "session", Value: "abc"})
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, http.MethodPost, upstreamMethod)
+	assert.Equal(t, "https://upstream.example/base/v1/items?search=a%20b&limit=10", upstreamURL)
+	assert.Equal(t, "application/x-www-form-urlencoded", upstreamHeaders.Get("Content-Type"))
+	assert.Equal(t, "trace-123", upstreamHeaders.Get("X-Trace-Id"))
+	assert.Equal(t, "session=abc", upstreamHeaders.Get("Cookie"))
+	assert.Empty(t, upstreamHeaders.Get("User-Agent"))
+	assert.Equal(t, "payload=abc", upstreamBody)
+}
+
+func TestServeHTTPForwardsStatusHeadersAndCookies(t *testing.T) {
+	handler := newTestProxy(func(_ *fhttp.Request) (*fhttp.Response, error) {
+		return newFHTTPResponse(http.StatusTeapot, fhttp.Header{
+			"Cache-Control": []string{"no-store"},
+			"Content-Type":  []string{"application/json"},
+			"Set-Cookie":    []string{"session=abc; HttpOnly", "theme=dark"},
+		}, strings.NewReader(`{"error":"teapot"}`)), nil
+	})
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	response := recorder.Result()
+	defer func() {
+		require.NoError(t, response.Body.Close())
+	}()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusTeapot, response.StatusCode)
+	assert.Equal(t, "application/json", response.Header.Get("Content-Type"))
+	assert.Equal(t, "no-store", response.Header.Get("Cache-Control"))
+	assert.Equal(t, []string{"session=abc; HttpOnly", "theme=dark"}, response.Header.Values("Set-Cookie"))
+	assert.Equal(t, `{"error":"teapot"}`, string(body))
+}
+
+func TestServeHTTPForwardsCompressedUpstreamResponse(t *testing.T) {
+	compressedBody := gzipBytes(t, "compressed response")
+	handler := newTestProxy(func(_ *fhttp.Request) (*fhttp.Response, error) {
+		return newFHTTPResponse(http.StatusOK, fhttp.Header{
+			"Content-Encoding": []string{"gzip"},
+			"Content-Length":   []string{fmt.Sprint(len(compressedBody))},
+			"Content-Type":     []string{"text/plain"},
+		}, bytes.NewReader(compressedBody)), nil
+	})
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	response := recorder.Result()
+	defer func() {
+		require.NoError(t, response.Body.Close())
+	}()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+	assert.Equal(t, "gzip", response.Header.Get("Content-Encoding"))
+	assert.Equal(t, fmt.Sprint(len(compressedBody)), response.Header.Get("Content-Length"))
+	assert.Equal(t, compressedBody, body)
+
+	reader, err := gzip.NewReader(bytes.NewReader(body))
+	require.NoError(t, err)
+	decompressedBody, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	assert.Equal(t, "compressed response", string(decompressedBody))
+}
+
 func TestHelloStreamsUpstreamResponse(t *testing.T) {
 	firstChunkWritten := make(chan struct{})
 	allowSecondChunk := make(chan struct{})
@@ -213,7 +388,7 @@ func TestHelloStreamsUpstreamResponse(t *testing.T) {
 		},
 	}
 
-	recorder := httptest.NewRecorder()
+	recorder := newLockedResponseRecorder()
 	handlerDone := make(chan struct{})
 	go func() {
 		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -223,7 +398,7 @@ func TestHelloStreamsUpstreamResponse(t *testing.T) {
 	<-firstChunkWritten
 
 	require.Eventually(t, func() bool {
-		return recorder.Body.String() == "first"
+		return recorder.BodyString() == "first"
 	}, time.Second, 10*time.Millisecond)
 
 	select {
@@ -239,7 +414,8 @@ func TestHelloStreamsUpstreamResponse(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("handler did not complete after upstream stream completed")
 	}
-	assert.Equal(t, "firstsecond", recorder.Body.String())
+	assert.Equal(t, http.StatusOK, recorder.Code())
+	assert.Equal(t, "firstsecond", recorder.BodyString())
 }
 
 func TestHeaderNamesSet(t *testing.T) {

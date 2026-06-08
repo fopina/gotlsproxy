@@ -16,5 +16,6 @@
 
 # other
 .DS_Store
+.gocache/
 dist/
 .vscode
