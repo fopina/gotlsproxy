@@ -3,17 +3,25 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Danny-Dasilva/CycleTLS/cycletls"
@@ -26,6 +34,7 @@ var version string = "DEV"
 
 type proxy struct {
 	mainURL            string
+	forwardProxy       bool
 	userAgent          string
 	ja3                string
 	timeout            int
@@ -33,6 +42,10 @@ type proxy struct {
 	upstreamProxy      string
 	keepRequestHeaders headerNames
 	newHTTPClient      func() (*fhttp.Client, error)
+	mitmCA             *x509.Certificate
+	mitmSigner         crypto.Signer
+	mitmCertCache      map[string]*tls.Certificate
+	mitmCertCacheMu    sync.Mutex
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
@@ -146,6 +159,150 @@ type contextDialerFunc func(context.Context, string, string) (net.Conn, error)
 
 func (fn contextDialerFunc) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	return fn(ctx, network, address)
+}
+
+type singleConnListener struct {
+	conn      net.Conn
+	acceptOne sync.Once
+}
+
+func newSingleConnListener(conn net.Conn) *singleConnListener {
+	return &singleConnListener{
+		conn: conn,
+	}
+}
+
+func (listener *singleConnListener) Accept() (net.Conn, error) {
+	var accepted bool
+	listener.acceptOne.Do(func() {
+		accepted = true
+	})
+	if accepted {
+		return listener.conn, nil
+	}
+	return nil, net.ErrClosed
+}
+
+func (listener *singleConnListener) Close() error {
+	return nil
+}
+
+func (listener *singleConnListener) Addr() net.Addr {
+	return listener.conn.LocalAddr()
+}
+
+func loadMITMCA(certPath, keyPath string) (*x509.Certificate, crypto.Signer, error) {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	certBlock, _ := pem.Decode(certPEM)
+	if certBlock == nil || certBlock.Type != "CERTIFICATE" {
+		return nil, nil, fmt.Errorf("failed to decode CA certificate PEM")
+	}
+	cert, err := x509.ParseCertificate(certBlock.Bytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !cert.IsCA {
+		return nil, nil, fmt.Errorf("MITM certificate must be a CA certificate")
+	}
+
+	keyBlock, _ := pem.Decode(keyPEM)
+	if keyBlock == nil {
+		return nil, nil, fmt.Errorf("failed to decode CA private key PEM")
+	}
+	key, err := parsePrivateKey(keyBlock.Bytes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return cert, key, nil
+}
+
+func parsePrivateKey(der []byte) (crypto.Signer, error) {
+	if key, err := x509.ParsePKCS8PrivateKey(der); err == nil {
+		signer, ok := key.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("private key does not implement crypto.Signer")
+		}
+		return signer, nil
+	}
+	if key, err := x509.ParsePKCS1PrivateKey(der); err == nil {
+		return key, nil
+	}
+	if key, err := x509.ParseECPrivateKey(der); err == nil {
+		return key, nil
+	}
+	return nil, fmt.Errorf("unsupported private key format")
+}
+
+func (handler *proxy) mitmCertificate(host string) (*tls.Certificate, error) {
+	if handler.mitmCA == nil || handler.mitmSigner == nil {
+		return nil, fmt.Errorf("CONNECT tunneling requires -mitm-ca-cert and -mitm-ca-key")
+	}
+
+	host = strings.TrimSuffix(host, ".")
+	handler.mitmCertCacheMu.Lock()
+	if handler.mitmCertCache == nil {
+		handler.mitmCertCache = make(map[string]*tls.Certificate)
+	}
+	if cert := handler.mitmCertCache[host]; cert != nil {
+		handler.mitmCertCacheMu.Unlock()
+		return cert, nil
+	}
+	handler.mitmCertCacheMu.Unlock()
+
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			CommonName: host,
+		},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	} else {
+		template.DNSNames = []string{host}
+	}
+	if handler.mitmCA.NotAfter.Before(template.NotAfter) {
+		template.NotAfter = handler.mitmCA.NotAfter
+	}
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, handler.mitmCA, &key.PublicKey, handler.mitmSigner)
+	if err != nil {
+		return nil, err
+	}
+	cert := &tls.Certificate{
+		Certificate: [][]byte{der, handler.mitmCA.Raw},
+		PrivateKey:  key,
+		Leaf:        template,
+	}
+
+	handler.mitmCertCacheMu.Lock()
+	handler.mitmCertCache[host] = cert
+	handler.mitmCertCacheMu.Unlock()
+
+	return cert, nil
 }
 
 func defaultProxyPort(scheme string) string {
@@ -273,7 +430,109 @@ func copyRequestHeadersToFHTTP(dst fhttp.Header, src http.Header, keepHeaders ma
 	}
 }
 
+func connectHost(req *http.Request) string {
+	if req.Host != "" {
+		return req.Host
+	}
+	return req.URL.Host
+}
+
+func certificateHost(targetHost string) string {
+	host, _, err := net.SplitHostPort(targetHost)
+	if err == nil {
+		return host
+	}
+	return targetHost
+}
+
+func (handler *proxy) serveConnect(w http.ResponseWriter, req *http.Request) {
+	if handler.mitmCA == nil || handler.mitmSigner == nil {
+		writeError(w, http.StatusNotImplemented, fmt.Errorf("CONNECT tunneling requires -mitm-ca-cert and -mitm-ca-key"))
+		return
+	}
+
+	targetHost := connectHost(req)
+	if targetHost == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("CONNECT request must include a target host"))
+		return
+	}
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("response writer does not support hijacking"))
+		return
+	}
+	conn, buffered, err := hijacker.Hijack()
+	if err != nil {
+		log.Printf("ERROR ProxyClientHijack: %v", err)
+		return
+	}
+	if buffered.Reader.Buffered() > 0 {
+		_ = conn.Close()
+		log.Printf("ERROR ProxyClientHijack: unexpected buffered CONNECT data")
+		return
+	}
+
+	if _, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		_ = conn.Close()
+		log.Printf("ERROR ProxyClientConnect: %v", err)
+		return
+	}
+
+	fallbackHost := certificateHost(targetHost)
+	tlsConn := tls.Server(conn, &tls.Config{
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			host := fallbackHost
+			if hello.ServerName != "" {
+				host = hello.ServerName
+			}
+			return handler.mitmCertificate(host)
+		},
+	})
+
+	innerHandler := &proxy{
+		mainURL:            "https://" + targetHost,
+		userAgent:          handler.userAgent,
+		ja3:                handler.ja3,
+		timeout:            handler.timeout,
+		printErrors:        handler.printErrors,
+		upstreamProxy:      handler.upstreamProxy,
+		keepRequestHeaders: handler.keepRequestHeaders,
+		newHTTPClient:      handler.newHTTPClient,
+	}
+
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(innerW http.ResponseWriter, innerReq *http.Request) {
+			innerHandler.ServeHTTP(innerW, innerReq)
+		}),
+	}
+	listener := newSingleConnListener(tlsConn)
+	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed && err != net.ErrClosed {
+		log.Printf("ERROR ProxyClientTLS: %v", err)
+	}
+}
+
+func (handler *proxy) upstreamRequestURL(req *http.Request) (string, int, error) {
+	if !handler.forwardProxy {
+		return fmt.Sprintf("%s%s", handler.mainURL, req.URL), http.StatusOK, nil
+	}
+
+	if req.Method == http.MethodConnect {
+		return "", http.StatusNotImplemented, fmt.Errorf("nested CONNECT requests are not supported")
+	}
+	if !req.URL.IsAbs() || req.URL.Host == "" {
+		return "", http.StatusBadRequest, fmt.Errorf("forward proxy requests must use an absolute URL")
+	}
+
+	return req.URL.String(), http.StatusOK, nil
+}
+
 func (handler *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if handler.forwardProxy && req.Method == http.MethodConnect {
+		handler.serveConnect(w, req)
+		return
+	}
+
 	newHTTPClient := handler.newHTTPClient
 	if newHTTPClient == nil {
 		newHTTPClient = handler.newCycleTLSHTTPClient
@@ -285,7 +544,13 @@ func (handler *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	upstreamRequest, err := fhttp.NewRequestWithContext(req.Context(), req.Method, fmt.Sprintf("%s%s", handler.mainURL, req.URL), req.Body)
+	targetURL, status, err := handler.upstreamRequestURL(req)
+	if err != nil {
+		writeError(w, status, err)
+		return
+	}
+
+	upstreamRequest, err := fhttp.NewRequestWithContext(req.Context(), req.Method, targetURL, req.Body)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -318,13 +583,18 @@ func (handler *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 func main() {
 	handler := &proxy{}
 	var listenAddress string
+	var mitmCACertPath string
+	var mitmCAKeyPath string
 
 	flag.StringVar(&handler.userAgent, "ua", "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:87.0) Gecko/20100101 Firefox/87.0", "User-Agent to spoof, should align with JA3 token")
 	flag.StringVar(&handler.ja3, "ja3", "771,4865-4867-4866-49195-52393-52392-49196-49200-49162-49161-49171-49172-51-57-47-53-10,0-23-65281-10-11-35-16-5-51-43-13-45-28-21,29-23-24-25-256-257,0", "JA3 token to spoof, should align with user-agent")
 	flag.StringVar(&listenAddress, "bind", "127.0.0.1:8888", "Listening address to bind to")
 	flag.StringVar(&handler.upstreamProxy, "upstream-proxy", "", "Upstream proxy (if any required)")
+	flag.StringVar(&mitmCACertPath, "mitm-ca-cert", "", "CA certificate PEM used to intercept HTTPS CONNECT requests in forward proxy mode")
+	flag.StringVar(&mitmCAKeyPath, "mitm-ca-key", "", "CA private key PEM used to intercept HTTPS CONNECT requests in forward proxy mode")
 	flag.IntVar(&handler.timeout, "timeout", 60, "Request timeout")
 	flag.BoolVar(&handler.printErrors, "print-errors", false, "Print request and response when an error (4xx and 5xx) is returned from upstream server")
+	flag.BoolVar(&handler.forwardProxy, "forward-proxy", false, "Run as a forward proxy and use each request's absolute URL as the upstream target")
 	flag.Var(&handler.keepRequestHeaders, "keep-request-header", "Request header to forward even if normally stripped; can be used multiple times")
 	versionPtr := flag.Bool("version", false, "display version")
 
@@ -333,7 +603,7 @@ func main() {
 
 Arguments:
   url string
-	is the target URL where requests should be proxied to, after user-agent header and TLS flags are modified to achieve the required JA3 fingerprint.
+	is the reverse proxy target URL where requests should be proxied to, after user-agent header and TLS flags are modified to achieve the required JA3 fingerprint. Omit when using -forward-proxy.
 
 Flags:
 `, os.Args[0])
@@ -346,14 +616,35 @@ Flags:
 		return
 	}
 
-	if flag.NArg() == 0 {
+	if handler.forwardProxy && flag.NArg() > 0 {
+		flag.Usage()
+		os.Exit(2)
+	}
+	if !handler.forwardProxy && flag.NArg() == 0 {
+		flag.Usage()
+		os.Exit(2)
+	}
+	if (mitmCACertPath == "") != (mitmCAKeyPath == "") {
 		flag.Usage()
 		os.Exit(2)
 	}
 
-	handler.mainURL = strings.TrimRight(flag.Arg(0), "/")
+	if !handler.forwardProxy {
+		handler.mainURL = strings.TrimRight(flag.Arg(0), "/")
+	}
+	if mitmCACertPath != "" {
+		var err error
+		handler.mitmCA, handler.mitmSigner, err = loadMITMCA(mitmCACertPath, mitmCAKeyPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 
-	log.Println("Up and running! All requests from http://" + listenAddress + " forwarded to " + handler.mainURL)
+	if handler.forwardProxy {
+		log.Println("Up and running! Forward proxy listening at http://" + listenAddress)
+	} else {
+		log.Println("Up and running! All requests from http://" + listenAddress + " forwarded to " + handler.mainURL)
+	}
 	err := http.ListenAndServe(listenAddress, handler)
 	if err != nil {
 		log.Fatal(err)

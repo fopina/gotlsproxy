@@ -3,11 +3,19 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -122,6 +130,33 @@ func gzipBytes(t *testing.T, body string) []byte {
 	require.NoError(t, err)
 	require.NoError(t, writer.Close())
 	return buf.Bytes()
+}
+
+func generateTestCA(t *testing.T) (*x509.Certificate, *rsa.PrivateKey, []byte, []byte) {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "gotlsproxy test CA",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+	cert, err := x509.ParseCertificate(der)
+	require.NoError(t, err)
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	return cert, key, certPEM, keyPEM
 }
 
 func fetchScrapflyJA3(t *testing.T, client *http.Client, url string) scrapflyJA3Response {
@@ -294,6 +329,128 @@ func TestServeHTTPForwardsPathQueryHeadersCookiesAndPostBody(t *testing.T) {
 	assert.Equal(t, "payload=abc", upstreamBody)
 }
 
+func TestServeHTTPForwardProxyUsesAbsoluteRequestURL(t *testing.T) {
+	var upstreamMethod string
+	var upstreamURL string
+	var upstreamHeaders fhttp.Header
+	var upstreamBody string
+
+	handler := newTestProxy(func(req *fhttp.Request) (*fhttp.Response, error) {
+		var err error
+		upstreamMethod = req.Method
+		upstreamURL = req.URL.String()
+		upstreamHeaders = req.Header.Clone()
+		bodyBytes, err := io.ReadAll(req.Body)
+		require.NoError(t, err)
+		upstreamBody = string(bodyBytes)
+
+		return newFHTTPResponse(http.StatusOK, fhttp.Header{}, strings.NewReader("ok")), nil
+	})
+	handler.forwardProxy = true
+	handler.mainURL = ""
+
+	request := httptest.NewRequest(http.MethodPost, "https://target.example/v1/items?search=a%20b&limit=10", strings.NewReader("payload=abc"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Proxy-Authorization", "Basic credentials")
+	request.Header.Set("X-Trace-Id", "trace-123")
+	request.Header.Set("User-Agent", "client-agent")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, http.MethodPost, upstreamMethod)
+	assert.Equal(t, "https://target.example/v1/items?search=a%20b&limit=10", upstreamURL)
+	assert.Equal(t, "application/x-www-form-urlencoded", upstreamHeaders.Get("Content-Type"))
+	assert.Equal(t, "trace-123", upstreamHeaders.Get("X-Trace-Id"))
+	assert.Empty(t, upstreamHeaders.Get("Proxy-Authorization"))
+	assert.Empty(t, upstreamHeaders.Get("User-Agent"))
+	assert.Equal(t, "payload=abc", upstreamBody)
+}
+
+func TestServeHTTPForwardProxyRejectsOriginFormRequest(t *testing.T) {
+	handler := newTestProxy(func(_ *fhttp.Request) (*fhttp.Response, error) {
+		t.Fatal("upstream request should not be sent")
+		return nil, nil
+	})
+	handler.forwardProxy = true
+	handler.mainURL = ""
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/relative/path", nil))
+
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), "absolute URL")
+}
+
+func TestServeHTTPForwardProxyRejectsConnectRequests(t *testing.T) {
+	handler := newTestProxy(func(_ *fhttp.Request) (*fhttp.Response, error) {
+		t.Fatal("upstream request should not be sent")
+		return nil, nil
+	})
+	handler.forwardProxy = true
+	handler.mainURL = ""
+
+	request := httptest.NewRequest(http.MethodConnect, "https://target.example:443", nil)
+	request.URL.Scheme = ""
+	request.URL.Host = "target.example:443"
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	assert.Equal(t, http.StatusNotImplemented, recorder.Code)
+	assert.Contains(t, recorder.Body.String(), "requires -mitm-ca-cert")
+}
+
+func TestServeHTTPForwardProxyHandlesHTTPSConnectWithMITMCA(t *testing.T) {
+	ca, key, _, _ := generateTestCA(t)
+	var upstreamMethod string
+	var upstreamURL string
+	var upstreamHeaders fhttp.Header
+
+	handler := newTestProxy(func(req *fhttp.Request) (*fhttp.Response, error) {
+		upstreamMethod = req.Method
+		upstreamURL = req.URL.String()
+		upstreamHeaders = req.Header.Clone()
+
+		return newFHTTPResponse(http.StatusOK, fhttp.Header{
+			"Content-Type": []string{"text/plain"},
+		}, strings.NewReader("ok")), nil
+	})
+	handler.forwardProxy = true
+	handler.mainURL = ""
+	handler.mitmCA = ca
+	handler.mitmSigner = key
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	proxyURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	client := &http.Client{Transport: &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{
+			RootCAs: roots,
+		},
+	}}
+
+	response, err := client.Get("https://target.example/v1/items?search=a%20b")
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, response.Body.Close())
+	}()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+	assert.Equal(t, "ok", string(body))
+	assert.Equal(t, http.MethodGet, upstreamMethod)
+	assert.Equal(t, "https://target.example:443/v1/items?search=a%20b", upstreamURL)
+	assert.Empty(t, upstreamHeaders.Get("User-Agent"))
+}
+
 func TestServeHTTPForwardsStatusHeadersAndCookies(t *testing.T) {
 	handler := newTestProxy(func(_ *fhttp.Request) (*fhttp.Response, error) {
 		return newFHTTPResponse(http.StatusTeapot, fhttp.Header{
@@ -436,6 +593,50 @@ func TestHeaderNamesSetRejectsEmptyName(t *testing.T) {
 
 	require.Error(t, headers.Set(" "))
 	assert.Empty(t, headers)
+}
+
+func TestLoadMITMCA(t *testing.T) {
+	_, _, certPEM, keyPEM := generateTestCA(t)
+	dir := t.TempDir()
+	certPath := dir + "/ca.crt"
+	keyPath := dir + "/ca.key"
+	require.NoError(t, os.WriteFile(certPath, certPEM, 0600))
+	require.NoError(t, os.WriteFile(keyPath, keyPEM, 0600))
+
+	cert, signer, err := loadMITMCA(certPath, keyPath)
+
+	require.NoError(t, err)
+	require.True(t, cert.IsCA)
+	require.NotNil(t, signer)
+}
+
+func TestMITMCertificateSignsHostCertificate(t *testing.T) {
+	ca, key, _, _ := generateTestCA(t)
+	handler := &proxy{
+		mitmCA:     ca,
+		mitmSigner: key,
+	}
+
+	cert, err := handler.mitmCertificate("target.example")
+	require.NoError(t, err)
+	require.NotNil(t, cert)
+	require.Len(t, cert.Certificate, 2)
+
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	require.NoError(t, err)
+	assert.Equal(t, []string{"target.example"}, leaf.DNSNames)
+
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	_, err = leaf.Verify(x509.VerifyOptions{
+		DNSName: "target.example",
+		Roots:   roots,
+	})
+	require.NoError(t, err)
+
+	cached, err := handler.mitmCertificate("target.example")
+	require.NoError(t, err)
+	assert.Same(t, cert, cached)
 }
 
 func TestScrapflyJA3Smoke(t *testing.T) {

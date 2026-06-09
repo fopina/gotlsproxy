@@ -15,10 +15,16 @@ Arguments:
 Flags:
   -bind string
     	Listening address to bind to (default "127.0.0.1:8888")
+  -forward-proxy
+    	Run as a forward proxy and use each request's absolute URL as the upstream target
   -ja3 string
     	JA3 token to spoof, should align with user-agent (default "771,4865-4867-4866-49195-49199-52393-52392-49196-49200-49162-49161-49171-49172-51-57-47-53-10,0-23-65281-10-11-35-16-5-51-43-13-45-28-21,29-23-24-25-256-257,0")
   -keep-request-header value
     	Request header to forward even if normally stripped; can be used multiple times
+  -mitm-ca-cert string
+    	CA certificate PEM used to intercept HTTPS CONNECT requests in forward proxy mode
+  -mitm-ca-key string
+    	CA private key PEM used to intercept HTTPS CONNECT requests in forward proxy mode
   -print-errors
     	Print request and response when an error (4xx and 5xx) is returned from upstream server
   -timeout int
@@ -43,6 +49,24 @@ $ docker run --rm ghcr.io/fopina/gotlsproxy:0.3 -version
 ### Response handling
 
 `gotlsproxy` uses CycleTLS's HTTP transport for upstream requests. Response bodies are streamed from the upstream server to the client instead of being fully buffered by gotlsproxy.
+
+### Forward proxy mode
+
+Use `-forward-proxy` to run without a fixed reverse-proxy target. In this mode, each request must use an absolute URL and gotlsproxy sends that request to the requested upstream host with the configured User-Agent and JA3 fingerprint:
+
+```
+$ gotlsproxy -forward-proxy
+$ curl -x http://127.0.0.1:8888 http://example.com/
+```
+
+HTTPS upstream URLs can be spoofed when the client sends an absolute `https://` request to gotlsproxy. Standard HTTPS proxy clients use `CONNECT`; gotlsproxy can intercept those requests when configured with a CA certificate and key that the client trusts:
+
+```
+$ gotlsproxy -forward-proxy -mitm-ca-cert ./ca.crt -mitm-ca-key ./ca.key
+$ curl --cacert ./ca.crt -x http://127.0.0.1:8888 https://example.com/
+```
+
+Without `-mitm-ca-cert` and `-mitm-ca-key`, `CONNECT` requests are rejected because the client owns the TLS handshake inside a plain tunnel.
 
 ### Body handling
 
